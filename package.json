@@ -1,0 +1,19 @@
+{
+  "name": "@homelab/media-engine",
+  "version": "0.1.0",
+  "description": "Shared media gateway, path resolver, visibility guard, and filesystem security boundary for homelab media server",
+  "type": "module",
+  "private": true,
+  "main": "src/index.js",
+  "exports": {
+    ".": {
+      "import": "./src/index.js",
+      "default": "./src/index.js"
+    }
+  },
+  "scripts": {
+    "test": "node --test src/**/*.test.js"
+  },
+  "keywords": ["media", "gateway", "resolver", "visibility"],
+  "license": "UNLICENSED"
+}
