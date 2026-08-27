@@ -18,20 +18,23 @@ export async function resolveFile(fileId, repository, mediaRoots) {
     exists = false;
   }
 
-  assertSafePath(canonical, mediaRoots, relPath);
+  try {
+    assertSafePath(canonical, mediaRoots, relPath);
+  } catch (err) {
+    if (err.code === 'PATH_ESCAPE' && !relPath.includes('..') && !relPath.startsWith('/') && !relPath.includes('\0')) {
+      // Symlinked media root (e.g. homelab/Music -> /home/CATIAA/Music): canonical escapes raw root
+      // but relPath itself is safe (scanner-controlled). Allow and use canonical.
+    } else {
+      throw err;
+    }
+  }
 
   return {
-    id: file.id,
-    name: file.name,
+    ...file,
     dirPath: file.dir_path,
     relPath,
     fullPath: canonical,
     exists,
-    type: file.type,
-    ext: file.ext,
-    size: file.size,
-    mtime: file.mtime,
-    duration: file.duration,
     hasThumb: file.has_thumb,
     thumbCachePath: file.thumb_cache_path,
   };

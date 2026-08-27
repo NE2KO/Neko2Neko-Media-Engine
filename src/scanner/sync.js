@@ -125,12 +125,16 @@ export async function incrementalSync({
             mtime: entry.mtime,
             duration: existing.duration ?? 0,
             has_thumb: existing.has_thumb || 0,
+            thumb_cache_path: existing.thumb_cache_path || null,
             last_accessed: 0,
             access_count: 0,
             last_verified: now,
             created_at: existing.created_at || entry.birthtime || entry.mtime,
+            created_at_embedded: existing.created_at_embedded || null,
             modified_at_fs: entry.mtime,
-            checksum: entry.checksum,
+            uploaded_at: existing.uploaded_at || null,
+            metadata_source: existing.metadata_source || null,
+            checksum: entry.checksum || existing.checksum || null,
           });
           if (entry.size !== existing.size) {
             await repository.updateFolderSize(dirId, entry.size - existing.size, now);
@@ -151,11 +155,16 @@ export async function incrementalSync({
             mtime: entry.mtime,
             duration: 0,
             has_thumb: 0,
+            thumb_cache_path: null,
             last_accessed: 0,
             access_count: 0,
             last_verified: now,
             created_at: entry.birthtime || entry.mtime,
+            created_at_embedded: null,
             modified_at_fs: entry.mtime,
+            uploaded_at: null,
+            metadata_source: null,
+            checksum: entry.checksum || null,
           });
           await repository.incrementFolderSize(dirId, entry.size, now);
         }

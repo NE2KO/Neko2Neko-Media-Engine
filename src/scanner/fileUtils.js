@@ -7,6 +7,9 @@ export function getFileId(relPath) {
 }
 
 export function resolveFullPath(relPath, mediaRoots) {
+  if (!mediaRoots || !Array.isArray(mediaRoots) || mediaRoots.length === 0) {
+    mediaRoots = [process.env.MEDIA_ROOT || '/home/CATIAA/homelab'];
+  }
   if (!relPath) return mediaRoots[0];
   if (mediaRoots.length === 1) {
     return join(mediaRoots[0], relPath);
@@ -21,6 +24,9 @@ export function resolveFullPath(relPath, mediaRoots) {
 }
 
 export function getRelPath(fullPath, mediaRoots) {
+  if (!mediaRoots || !Array.isArray(mediaRoots) || mediaRoots.length === 0) {
+    return basename(fullPath);
+  }
   for (const root of mediaRoots) {
     if (fullPath.startsWith(root)) {
       const rel = fullPath.substring(root.length).replace(/^\/+/, '');
