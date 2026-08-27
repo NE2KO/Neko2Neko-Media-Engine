@@ -2,8 +2,8 @@ import { join, sep } from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { assertSafePath } from '../guard.js';
 
-export async function resolveFile(fileId, stmts, mediaRoots) {
-  const file = stmts.getFileWithPath.get(fileId);
+export async function resolveFile(fileId, repository, mediaRoots) {
+  const file = repository.getFileWithPath(fileId);
   if (!file) return null;
 
   const relPath = file.dir_path ? join(file.dir_path, file.name) : file.name;

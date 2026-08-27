@@ -9,6 +9,14 @@
     ".": {
       "import": "./src/index.js",
       "default": "./src/index.js"
+    },
+    "./visibility": {
+      "import": "./src/visibility/visibility.js",
+      "default": "./src/visibility/visibility.js"
+    },
+    "./changeset": {
+      "import": "./src/visibility/changeset.js",
+      "default": "./src/visibility/changeset.js"
     }
   },
   "scripts": {
