@@ -20,8 +20,16 @@
     }
   },
   "scripts": {
-    "test": "node --test src/**/*.test.js"
+    "test": "node --test src/**/*.test.js tests/**/*.test.js"
   },
-  "keywords": ["media", "gateway", "resolver", "visibility"],
-  "license": "UNLICENSED"
+  "keywords": [
+    "media",
+    "gateway",
+    "resolver",
+    "visibility"
+  ],
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "better-sqlite3": "^13.0.3"
+  }
 }

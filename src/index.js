@@ -2,7 +2,7 @@ export { MediaEngine } from './MediaEngine.js';
 export { MediaScanner } from './MediaScanner.js';
 export { EventBus } from './events/EventBus.js';
 
-export { resolveFile } from './resolver/resolveFile.js';
+export { resolveFile, resolveFileForEngine } from './resolver/resolveFile.js';
 
 export {
   ensureTables,
@@ -43,6 +43,18 @@ export {
 export { scanFileSystem, streamFileSystem } from './scanner/walk.js';
 export { getDuration, probeVideoMetadata, extractTags, parseTimestamp } from './scanner/probe.js';
 export { incrementalSync, enrichDurationsBatch, enrichMetadataBatch } from './scanner/sync.js';
+
+export {
+  readMetadata,
+  embedCover,
+  writeLyrics,
+  readCover,
+  writeMetadata,
+} from './scanner/metadataWriter.js';
+
+export { generateHLSSegments } from './scanner/hls.js';
+
+export { runFfmpeg } from './scanner/transcode.js';
 
 export { createOperationResult, successResult, errorResult } from './operations/result.js';
 export { OperationLock } from './operations/lock.js';
