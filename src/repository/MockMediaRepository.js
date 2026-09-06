@@ -8,6 +8,8 @@ export class MockMediaRepository extends MediaRepository {
     this._visibility = new Map();
     this._changes = [];
     this._changesets = new Map();
+    this._playlistTracks = new Map();
+    this._playlistTotals = new Map();
     this._nextId = 1;
   }
 
@@ -21,7 +23,7 @@ export class MockMediaRepository extends MediaRepository {
     const file = this._files.get(id);
     if (!file) return null;
     const folder = this._folders.get(file.dir_id);
-    return { ...file, dir_path: folder?.path || null };
+    return { ...file, dir_path: folder?.path || '' };
   }
 
   upsertFile(file) {
@@ -215,16 +217,73 @@ export class MockMediaRepository extends MediaRepository {
   }
 
   detectConflicts(changesetId, targetWebId, targetRepository) {
-    return [];
+    const cs = this._changesets.get(changesetId);
+    if (!cs) throw new Error(`Changeset ${changesetId} not found`);
+
+    const changesetItems = this._changes.filter(c => cs.items.includes(c.changeId));
+    const conflicts = [];
+
+    for (const item of changesetItems) {
+      const targetState = targetRepository.getVisibilityState(item.fileId, targetWebId);
+      const expectedState = item.previous_state;
+
+      if (targetState !== expectedState) {
+        conflicts.push({
+          fileId: item.fileId,
+          changeId: item.changeId,
+          operation: item.operation,
+          expectedState,
+          actualState: targetState,
+          reason: `Target environment has state '${targetState}' but changeset expects '${expectedState}'`,
+        });
+      }
+    }
+
+    return conflicts;
   }
 
   applyChangeset(changesetId, targetWebId, targetRepository) {
-    throw new Error('MockMediaRepository.applyChangeset not implemented');
+    const cs = this._changesets.get(changesetId);
+    if (!cs) throw new Error(`Changeset ${changesetId} not found`);
+    if (cs.state !== 'FINALIZED') throw new Error(`Cannot apply changeset in state ${cs.state}`);
+
+    const conflicts = this.detectConflicts(changesetId, targetWebId, targetRepository);
+    if (conflicts.length > 0) {
+      const conflictSummary = conflicts.map(c => `${c.fileId}: expected ${c.expectedState}, got ${c.actualState}`).join('; ');
+      throw new Error(`Conflicts detected before apply: ${conflictSummary}`);
+    }
+
+    const changesetItems = this._changes.filter(c => cs.items.includes(c.changeId));
+
+    for (const item of changesetItems) {
+      if (item.operation === 'DELETE') {
+        targetRepository.setVisibilityState(item.fileId, targetWebId, 'DELETED');
+      } else if (item.operation === 'RESTORE') {
+        targetRepository.setVisibilityState(item.fileId, targetWebId, 'PRESENT');
+      }
+    }
+
+    const now = Date.now();
+    cs.state = 'APPLIED';
+    cs.applied_at = now;
+    cs.applied_by = targetWebId;
+    cs.promotion_source = cs.web_id;
+    cs.promotion_target = targetWebId;
+
+    return {
+      changeset_id: changesetId,
+      state: 'APPLIED',
+      applied_at: now,
+      applied_by: targetWebId,
+      promotion_source: cs.web_id,
+      promotion_target: targetWebId,
+      appliedChanges: changesetItems.length,
+    };
   }
 
   // --- File queries ---
 
-  listFiles({ webId, folderId, type, favoriteOnly, sortBy = 'created_at', sortOrder = 'desc', limit = 100, offset = 0 }) {
+  listFiles({ webId, folderId, type, favoriteOnly, sortBy = 'created_at', sortOrder = 'desc', limit = 100, offset = 0, cursor, prevCursor }) {
     let items = [];
     for (const file of this._files.values()) {
       if (!this.isVisible(file.id, webId)) continue;
@@ -238,16 +297,19 @@ export class MockMediaRepository extends MediaRepository {
       const vb = b[sortBy] || 0;
       return sortOrder === 'desc' ? (vb > va ? 1 : -1) : (va > vb ? 1 : -1);
     });
-    const hasMore = items.length > limit;
-    if (hasMore) items = items.slice(0, limit);
-    return { items, hasMore, limit, offset };
+    const total = items.length;
+    items = items.slice(offset, offset + limit);
+    const hasMore = offset + items.length < total;
+    return { items, hasMore, limit, offset, total };
   }
 
-  searchFiles({ webId, query, type = null, limit = 50 }) {
+  searchFiles({ webId, query, type = null, folderId = null, scope = 'all', limit = 50 }) {
     const q = query.toLowerCase();
     const results = [];
     for (const file of this._files.values()) {
       if (!this.isVisible(file.id, webId)) continue;
+      if (scope === 'current' && folderId && file.dir_id !== folderId) continue;
+      if (folderId && folderId !== null && scope !== 'current' && file.dir_id !== folderId) continue;
       if (file.name.toLowerCase().includes(q)) {
         if (!type || type === 'all' || file.type === type) {
           results.push(file);
@@ -280,11 +342,21 @@ export class MockMediaRepository extends MediaRepository {
     };
   }
 
-  updateMetadata(fileId, { isFavorite = null, isLocked = null }) {
+  updateMetadata(fileId, changes = {}) {
     const file = this._files.get(fileId);
     if (!file) return { ok: false };
-    if (isFavorite !== null) file.is_favorite = isFavorite ? 1 : 0;
-    if (isLocked !== null) file.is_locked = isLocked ? 1 : 0;
+    if (changes.isFavorite !== undefined) file.is_favorite = changes.isFavorite ? 1 : 0;
+    if (changes.isLocked !== undefined) file.is_locked = changes.isLocked ? 1 : 0;
+    if (changes.title !== undefined) file.title = changes.title;
+    if (changes.artist !== undefined) file.artist = changes.artist;
+    if (changes.album !== undefined) file.album = changes.album;
+    if (changes.genre !== undefined) file.genre = changes.genre;
+    if (changes.cover_source !== undefined) file.cover_source = changes.cover_source;
+    if (changes.lyrics !== undefined) file.lyrics = changes.lyrics;
+    if (changes.lyrics_synced !== undefined) file.lyrics_synced = changes.lyrics_synced;
+    if (changes.lyrics_romaji !== undefined) file.lyrics_romaji = changes.lyrics_romaji;
+    if (changes.youtube_id !== undefined) file.youtube_id = changes.youtube_id;
+    if (changes.video_offset !== undefined) file.video_offset = changes.video_offset;
     return { ok: true };
   }
 
@@ -330,10 +402,10 @@ export class MockMediaRepository extends MediaRepository {
   }
 
   getSearchSuggestions(query, webId) {
-    const q = `%${query.trim()}%`;
+    const q = query.trim();
     const suggestions = [];
     for (const file of this._files.values()) {
-      if (this.isVisible(file.id, webId) && file.name.includes(query)) {
+      if (this.isVisible(file.id, webId) && file.name.includes(q)) {
         suggestions.push(file.name);
         if (suggestions.length >= 10) break;
       }
@@ -344,7 +416,7 @@ export class MockMediaRepository extends MediaRepository {
   listFavorites(webId) {
     const results = [];
     for (const file of this._files.values()) {
-      if (this.isVisible(file.id, webId) && file.is_favorite && file.type === 'audio') {
+      if (this.isVisible(file.id, webId) && file.is_favorite) {
         const name = file.name || '';
         const displayName = name.replace(/\.[^/.]+$/, '') || name;
         results.push({
@@ -352,10 +424,8 @@ export class MockMediaRepository extends MediaRepository {
           file_id: file.id,
           display_name: displayName,
           title: displayName,
-          artist: file.artist || '',
-          album: file.album || '',
           duration: file.duration || 0,
-          type: 'audio',
+          type: file.type,
           ext: (file.ext || '').replace(/^\./, ''),
           is_favorite: 1,
           has_thumb: file.has_thumb || 0,
@@ -376,30 +446,239 @@ export class MockMediaRepository extends MediaRepository {
   }
 
   findByDirPattern(folderName, subfolderPattern, limit, offset) {
-    return [];
+    const results = [];
+    for (const file of this._files.values()) {
+      const folder = this._folders.get(file.dir_id);
+      if (!folder) continue;
+      const path = folder.path;
+
+      let folderMatch = false;
+      if (!folderName) {
+        folderMatch = !path || path === '' || !path.includes('/');
+      } else {
+        folderMatch = path === folderName || path.startsWith(folderName + '/');
+      }
+
+      let patternMatch = false;
+      if (subfolderPattern && subfolderPattern.includes('%')) {
+        const regexStr = '^' + subfolderPattern.replace(/%/g, '.*').replace(/_/g, '.') + '$';
+        patternMatch = new RegExp(regexStr).test(path);
+      } else if (subfolderPattern) {
+        patternMatch = path === subfolderPattern;
+      } else {
+        patternMatch = true;
+      }
+
+      if (folderMatch && patternMatch) {
+        results.push({
+          id: file.id,
+          name: file.name,
+          size: file.size,
+          mtime: file.mtime,
+          dir_id: file.dir_id,
+          duration: file.duration,
+          checksum: file.checksum,
+        });
+      }
+    }
+
+    return results.slice(offset, offset + limit);
   }
 
-  updateFolderSize() {}
-  incrementFolderSize() {}
-  decrementFolderSize() {}
-  updateCreatedAt() {}
-  deleteFilesByFolder(dirId) {
-    for (const [id, file] of this._files) {
-      if (file.dir_id === dirId) this._files.delete(id);
+  updateFolderSize(dirId, delta, now) {
+    const folder = this._folders.get(dirId);
+    if (!folder) return;
+    folder.total_size = Math.max(0, (folder.total_size || 0) + delta);
+    folder.last_updated = now || Date.now();
+  }
+
+  incrementFolderSize(dirId, size, now) {
+    this.updateFolderSize(dirId, size, now);
+  }
+
+  decrementFolderSize(dirId, size, now) {
+    this.updateFolderSize(dirId, -size, now);
+  }
+
+  updateCreatedAt(id, createdAt) {
+    const file = this._files.get(id);
+    if (file) {
+      file.created_at = createdAt;
     }
   }
-  deleteFolder(id) { this._folders.delete(id); }
-  getAllFolders() { return [...this._folders.values()].map(f => ({ id: f.id, path: f.path })); }
-  reconcileFolders() {}
-  updateAllRecursiveCounts() { return 0; }
-  getFilesNeedingDuration() { return []; }
-  updateDuration() {}
-  updateCodecInfo() {}
-  updatePlaylistTrackDurationByPath() {}
-  refreshPlaylistTrackDurations() {}
-  recomputeAllPlaylistTotals() {}
-  getFilesNeedingMetadata() { return []; }
-  updateCreatedAtEmbedded() {}
+
+  deleteFilesByFolder(dirId) {
+    for (const [id, file] of this._files) {
+      if (file.dir_id === dirId) {
+        this._files.delete(id);
+      }
+    }
+  }
+
+  deleteFolder(id) {
+    this._folders.delete(id);
+  }
+
+  getAllFolders() {
+    return [...this._folders.values()].map(f => ({ id: f.id, path: f.path }));
+  }
+
+  reconcileFolders() {
+    for (const folder of this._folders.values()) {
+      let fileCount = 0;
+      let totalSize = 0;
+      for (const file of this._files.values()) {
+        if (file.dir_id === folder.id) {
+          fileCount++;
+          totalSize += file.size || 0;
+        }
+      }
+      folder.file_count = fileCount;
+      folder.total_size = totalSize;
+    }
+  }
+
+  updateAllRecursiveCounts() {
+    const folderMap = new Map();
+    for (const folder of this._folders.values()) {
+      folderMap.set(folder.id, folder);
+    }
+
+    for (const folder of this._folders.values()) {
+      const descendants = this._getDescendantFolderIds(folder.id, folderMap);
+      descendants.push(folder.id);
+
+      let recursiveCount = 0;
+      let recursiveSize = 0;
+      for (const descId of descendants) {
+        for (const file of this._files.values()) {
+          if (file.dir_id === descId) {
+            recursiveCount++;
+            recursiveSize += file.size || 0;
+          }
+        }
+      }
+
+      folder.recursive_file_count = recursiveCount;
+      folder.recursive_total_size = recursiveSize;
+    }
+
+    return this._folders.size;
+  }
+
+  _getDescendantFolderIds(folderId, folderMap) {
+    const descendants = [];
+    const queue = [folderId];
+    const visited = new Set();
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (visited.has(current)) continue;
+      visited.add(current);
+
+      for (const folder of folderMap.values()) {
+        if (folder.parent_id === current) {
+          descendants.push(folder.id);
+          queue.push(folder.id);
+        }
+      }
+    }
+
+    return descendants;
+  }
+
+  getFilesNeedingDuration(limit = 100) {
+    const results = [];
+    for (const file of this._files.values()) {
+      if (!file.duration || file.duration === 0) {
+        const folder = this._folders.get(file.dir_id);
+        results.push({
+          id: file.id,
+          name: file.name,
+          path: folder ? folder.path : '',
+          type: file.type,
+        });
+        if (results.length >= limit) break;
+      }
+    }
+    return results;
+  }
+
+  updateDuration(id, duration) {
+    const file = this._files.get(id);
+    if (file) {
+      file.duration = duration;
+    }
+    return { ok: !!file };
+  }
+
+  updateCodecInfo(id, codecInfo, isStreamCompatible) {
+    const file = this._files.get(id);
+    if (file) {
+      file.codec_info = codecInfo;
+      file.is_stream_compatible = isStreamCompatible ? 1 : 0;
+    }
+    return { ok: !!file };
+  }
+
+  getFilesNeedingMetadata(limit = 20) {
+    const results = [];
+    for (const file of this._files.values()) {
+      if (!file.created_at_embedded) {
+        const folder = this._folders.get(file.dir_id);
+        results.push({
+          id: file.id,
+          name: file.name,
+          path: folder ? folder.path : '',
+          type: file.type,
+        });
+        if (results.length >= limit) break;
+      }
+    }
+    return results;
+  }
+
+  updateCreatedAtEmbedded(id, createdAt, source) {
+    const file = this._files.get(id);
+    if (file) {
+      file.created_at_embedded = createdAt;
+      file.metadata_source = source;
+    }
+    return { ok: !!file };
+  }
+
+  updatePlaylistTrackDurationByPath(duration, fullPath) {
+    this._playlistTracks.set(fullPath, duration);
+    return { ok: true };
+  }
+
+  refreshPlaylistTrackDurations() {
+    let refreshed = 0;
+    for (const file of this._files.values()) {
+      if (file.duration && file.duration > 0) {
+        const folder = this._folders.get(file.dir_id);
+        const fullPath = folder ? `${folder.path}/${file.name}` : file.name;
+        if (this._playlistTracks.has(fullPath)) {
+          this._playlistTracks.set(fullPath, file.duration);
+          refreshed++;
+        }
+      }
+    }
+    return refreshed;
+  }
+
+  recomputeAllPlaylistTotals() {
+    const totals = new Map();
+    for (const [path, duration] of this._playlistTracks.entries()) {
+      const parts = path.split('/');
+      if (parts.length > 1) {
+        const playlistPath = parts.slice(0, -1).join('/');
+        totals.set(playlistPath, (totals.get(playlistPath) || 0) + duration);
+      }
+    }
+    this._playlistTotals = totals;
+    return { recomputed: true, playlistCount: totals.size };
+  }
 
   // --- Raw access (no-op for mock) ---
   query() { return []; }

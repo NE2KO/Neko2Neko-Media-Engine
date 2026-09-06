@@ -38,6 +38,8 @@ export class MediaRepository {
   listFiles({ webId, folderId, type, favoriteOnly, sortBy, sortOrder, limit, cursor, prevCursor }) { throw new Error('Not implemented'); }
   searchFiles({ webId, query, type, folderId, scope, limit }) { throw new Error('Not implemented'); }
   getFileMetadata(fileId, webId) { throw new Error('Not implemented'); }
+  // Generic metadata fields only: title, description, isFavorite, isLocked, etc.
+  // Domain-specific fields (artist, album, genre, lyrics, ...) are handled by the application layer.
   updateMetadata(fileId, changes) { throw new Error('Not implemented'); }
   getStats(webId) { throw new Error('Not implemented'); }
   getBatchFiles(ids, webId) { throw new Error('Not implemented'); }

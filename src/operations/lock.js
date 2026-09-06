@@ -1,21 +1,48 @@
 export class OperationLock {
   constructor() {
-    this._locks = new Map();
+    this._entries = new Map();
   }
 
   async acquire(fileId, operation) {
-    while (this._locks.has(fileId)) {
-      await new Promise(r => setTimeout(r, 10));
+    let entry = this._entries.get(fileId);
+
+    if (!entry) {
+      entry = { locked: true, operation, queue: [] };
+      this._entries.set(fileId, entry);
+      return () => this._release(fileId);
     }
-    this._locks.set(fileId, operation);
-    return () => this._locks.delete(fileId);
+
+    if (!entry.locked) {
+      entry.locked = true;
+      entry.operation = operation;
+      return () => this._release(fileId);
+    }
+
+    return new Promise(resolve => {
+      entry.queue.push({ resolve, operation });
+    });
   }
 
   isLocked(fileId) {
-    return this._locks.has(fileId);
+    const entry = this._entries.get(fileId);
+    return entry !== undefined && entry.locked;
   }
 
   getOperation(fileId) {
-    return this._locks.get(fileId) || null;
+    const entry = this._entries.get(fileId);
+    return entry && entry.locked ? entry.operation : null;
+  }
+
+  _release(fileId) {
+    const entry = this._entries.get(fileId);
+    if (!entry || !entry.locked) return;
+
+    const next = entry.queue.shift();
+    if (next) {
+      entry.operation = next.operation;
+      next.resolve(() => this._release(fileId));
+    } else {
+      this._entries.delete(fileId);
+    }
   }
 }

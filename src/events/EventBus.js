@@ -14,8 +14,14 @@ export class EventBus {
   emit(event, data) {
     const handlers = this._listeners.get(event);
     if (!handlers) return;
-    for (const handler of handlers) {
-      try { handler(data); } catch {}
+
+    const handlersCopy = new Set(handlers);
+    for (const handler of handlersCopy) {
+      try {
+        handler(data);
+      } catch (error) {
+        console.error(`[EventBus] Event "${event}" handler error:`, error.message, '\n', error.stack);
+      }
     }
   }
 

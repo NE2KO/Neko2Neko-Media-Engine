@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { extname } from 'node:path';
 
 const VIDEO_CANON = {
@@ -24,7 +24,7 @@ export function normalizeVideoCodec(name) {
 }
 
 export function normalizeAudioCodec(name) {
-  return AUDIO_CANON[(name || '').toLowerCase()] || (name || '').toLowerCase() || '';
+  return AUDIO_CANON[(name || '').toLowerCase()] || '';
 }
 
 export function getDuration(filePath) {
@@ -50,16 +50,42 @@ export function getDuration(filePath) {
   });
 }
 
-export function probeVideoMetadata(filePath) {
+async function runFfprobe(filePath) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
   try {
-    const result = spawnSync('ffprobe', [
+    const proc = spawn('ffprobe', [
       '-v', 'error',
       '-print_format', 'json',
       '-show_entries', 'format=format_name:stream=index,codec_type,codec_name,codec_tag_string,width,height,profile',
       filePath,
-    ], { encoding: 'utf-8', timeout: 15000 });
-    if (result.status !== 0) return null;
-    const data = JSON.parse(result.stdout || '{}');
+    ], { stdio: ['ignore', 'pipe', 'pipe'], signal: controller.signal });
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (chunk) => { stdout += chunk; });
+    proc.stderr.on('data', (chunk) => { stderr += chunk; });
+
+    const exitCode = await new Promise((resolve) => {
+      proc.on('close', (code) => resolve(code));
+      proc.on('error', (err) => {
+        if (err.code === 'ENOENT') resolve('ENOENT');
+        else resolve('SPAWN_ERROR');
+      });
+    });
+
+    if (exitCode !== 0) return null;
+    if (!stdout || !stdout.trim()) return null;
+
+    let data;
+    try {
+      data = JSON.parse(stdout);
+    } catch {
+      return null;
+    }
+
     const video = (data.streams || []).find(s => s.codec_type === 'video');
     const audio = (data.streams || []).find(s => s.codec_type === 'audio');
     if (!video) return null;
@@ -88,9 +114,47 @@ export function probeVideoMetadata(filePath) {
       format: (data.format?.format_name || '').toLowerCase(),
       is_stream_compatible: isCompatible ? 1 : 0,
     };
+  } catch (err) {
+    if (err.name === 'AbortError' || err.code === 'ABORT_ERR') return null;
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function probeVideoMetadata(filePath) {
+  try {
+    return await runFfprobe(filePath);
   } catch {
     return null;
   }
+}
+
+export async function probeWithConcurrency(files, limit = 2) {
+  const results = [];
+  const executing = [];
+  let index = 0;
+
+  const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 2;
+
+  for (const file of files) {
+    const task = (async () => {
+      const result = await probeVideoMetadata(file);
+      return { file, result };
+    })();
+
+    executing.push(task);
+
+    if (executing.length >= safeLimit) {
+      results.push(await executing.shift());
+    }
+  }
+
+  while (executing.length > 0) {
+    results.push(await executing.shift());
+  }
+
+  return results;
 }
 
 const TAG_DATE_PATTERNS = [

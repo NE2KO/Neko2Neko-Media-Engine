@@ -1,16 +1,16 @@
 import { createHash } from 'node:crypto';
 import { join, basename, dirname } from 'node:path';
-import fs from 'node:fs';
+import fs from 'node:fs/promises';
 
 export function getFileId(relPath) {
   return createHash('md5').update(relPath).digest('hex');
 }
 
 export function resolveFullPath(relPath, mediaRoots) {
+  if (!relPath) return '';
   if (!mediaRoots || !Array.isArray(mediaRoots) || mediaRoots.length === 0) {
-    mediaRoots = [process.env.MEDIA_ROOT || '/home/CATIAA/homelab'];
+    return relPath;
   }
-  if (!relPath) return mediaRoots[0];
   if (mediaRoots.length === 1) {
     return join(mediaRoots[0], relPath);
   }

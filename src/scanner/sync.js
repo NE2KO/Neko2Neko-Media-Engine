@@ -67,7 +67,11 @@ export async function incrementalSync({
         if (useDirectRoot) {
           folderPaths.add(subFolderPath);
         } else {
-          folderPaths.add(folderName + '/' + subFolderPath);
+          // entry.relPath already includes the root folderName prefix injected by
+          // streamFileSystem(rootPath, rootRelPath=folderName, ...), so we must
+          // NOT prepend folderName again or we get double-prefix like
+          // "homelab/homelab/Music/..." which breaks folderIdMap lookups.
+          folderPaths.add(subFolderPath);
         }
       } else if (useDirectRoot) {
         folderPaths.add('');
