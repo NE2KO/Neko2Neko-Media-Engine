@@ -1,103 +1,111 @@
 # @homelab/media-engine
 
-> Shared media gateway, path resolver, visibility guard, and filesystem safety boundary for the Homelab Media Server.
-
 [![Node](https://img.shields.io/badge/Node-%3E%3D18-green)](https://nodejs.org)
 [![ESM](https://img.shields.io/badge/ESM-only-blue)](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules)
-[![Private](https://img.shields.io/badge/private-true-lightgrey)](#)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey)](#license)
 
-Version **0.1.0** · ESM-only · `file:../../media-engine` (no npm publish yet)
+**The single security boundary between your web application and the filesystem for all media operations.**
 
----
-
-## Table of Contents
-
-- [About](#about)
-- [Architecture](#architecture)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [API Reference](#api-reference)
-  - [MediaEngine](#mediaengine)
-  - [MediaScanner](#mediascanner)
-  - [MediaRepository](#mediarepository)
-  - [MockMediaRepository](#mockmediarepository)
-  - [Scanner Utilities](#scanner-utilities)
-  - [Safety Guards](#safety-guards)
-  - [Visibility & Changesets](#visibility--changesets)
-  - [Operations](#operations)
-  - [Events](#events)
-- [File → Web Path](#file--web-path)
-- [Visibility Semantics](#visibility-semantics)
-- [Filesystem Safety](#filesystem-safety)
-- [Project Structure](#project-structure)
-- [Testing](#testing)
-- [Related](#related)
+`@homelab/media-engine` is a production-grade Node.js library that owns the complete media lifecycle: discovery, safe resolution, visibility management, streaming, and storage. Your web layer never touches media paths, the filesystem, or storage internals — it asks the engine.
 
 ---
 
-## About
+## Why media-engine?
 
-`@homelab/media-engine` is the **single domain boundary** for all media resources in the Homelab stack. The web layer (`homelab-media-server`) never touches the filesystem or SQLite directly for media — it asks the engine.
+Most web applications that serve media either:
 
-**What the engine owns:**
-- Incremental filesystem discovery (`MediaScanner`)
-- Safe path resolution (`resolveFile` + `assertSafePath` / `assertVisible`)
-- Visibility (soft-delete per `webId`, `media_visibility` table)
-- Cross-env changeset promotion (`beta → pre → release`)
-- File queries (listing, search, metadata, batch, stats) with visibility
-- Operation primitives (`OperationLock`, `OperationResult`, future `trash`/`purge`/`move`/`rename`)
+- **Leak filesystem paths** into route handlers, creating security vulnerabilities
+- **Duplicate resolution logic** across services, leading to inconsistency
+- **Mingle media concerns** with HTTP concerns, making testing impossible
 
-**What stays in the backend:**
-- HTTP (`res.sendFile`, `Range`, `Cache-Control`), SSE, multipart upload
-- FFmpeg (thumbnails, HLS, transcode), YouTube/video cache, playlists, send queue, ADB, Telegram, WhatsApp, AI
+`media-engine` solves this by enforcing a strict **single media boundary**:
 
-> Design decisions and the 13-phase production plan live in [`plan.md`](plan.md).
+```
+Web Application
+     ↓  (opaque IDs, streams, resources)
+Media Engine  ← the ONLY component that touches media paths / filesystem
+     ↓
+Repository  (pluggable storage layer)
+     ↓
+Filesystem / Database
+```
+
+The backend stays **filesystem-blind**. It receives streams, metadata objects, and opaque IDs — never raw paths.
+
+---
+
+## Key Features
+
+| Feature | Benefit |
+|---------|---------|
+| **Single Media Boundary** | Only the engine touches media paths. Web apps use opaque IDs. |
+| **Path Traversal Protection** | Symlink-aware canonicalization, `..` rejection, null-byte guards. |
+| **Per-User Visibility** | Soft-delete per user (webId). Deleted for one user, visible to another. |
+| **Cross-Environment Changesets** | Promote media changes across environments (beta → pre → release). |
+| **Streaming-First API** | Returns Node.js Readable streams with correct MIME types and cache headers. |
+| **Incremental Scanner** | Efficient filesystem discovery with debounced watcher, periodic rescan, and adaptive CPU backpressure. |
+| **FTS Search** | Full-text search via FTS5, visibility-filtered, with cursor pagination. |
+| **Batch Operations** | Efficient bulk lookups, metadata updates, and filename resolution. |
+| **Event Bus** | Typed events for scan lifecycle, scanner state changes, and custom hooks. |
+| **Pluggable Storage** | Repository interface; SQLite implementation included, Mock for tests. |
+| **Zero Core Dependencies** | Only `better-sqlite3` for the SQLite backend. No other runtime deps. |
 
 ---
 
 ## Architecture
 
-```text
-HTTP Route
-  ↓  engine.resolve() / getServeTarget() / listFiles() / searchFiles()
-MediaEngine  ── visibility, sorting, pagination, safety
-  ↓  repository.listFiles() / getFileWithPath() / isVisible()
-MediaRepository  (interface — dependency injection)
-  ↓
-SqliteMediaRepository  (backend)  or  MockMediaRepository  (tests)
-  ↓  better-sqlite3 / in-memory
-SQLite  ── files, folders, files_fts (FTS5), media_visibility, media_changesets
-  ↓
-Filesystem  ── MEDIA_ROOT (e.g. /home/CATIAA/homelab, homelab/Music → /home/CATIAA/Music via symlink)
 ```
-
-**No second scanner, no second resolver.** `fileResolver.js`, `fileScanner.js`, `scannerWorker.js`, `scannerClient.js`, `watcher.js` are deleted — `MediaScanner` is the only scanner.
+┌─────────────────────────────────────────────────────┐
+│  Web Application (Express, Fastify, Hono, etc.)     │
+│  Uses: engine.resolve(), engine.getServeTarget()     │
+│        engine.listFiles(), engine.openMedia()        │
+└──────────────────────┬──────────────────────────────┘
+                       │ opaque IDs, streams, metadata
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│  MediaEngine                                        │
+│  • resolve(fileId) → metadata (no paths)            │
+│  • openMedia(fileId) → { stream, mimeType, size }   │
+│  • getServeTarget(fileId) → { stream, headers }     │
+│  • listFiles() / searchFiles() / getStats()         │
+│  • Visibility guard, changeset promotion             │
+│  • Path validation (assertSafePath)                  │
+└──────────────────────┬──────────────────────────────┘
+                       │ repository interface calls
+                       ▼
+┌─────────────────────────────────────────────────────┐
+│  MediaRepository (interface)                         │
+│  getFileById, upsertFile, isVisible, listFiles, ... │
+└──────────────┬──────────────────────┬────────────────┘
+               │                      │
+               ▼                      ▼
+┌──────────────────────┐   ┌──────────────────────────┐
+│ SqliteRepository     │   │ MockRepository (tests)    │
+│ better-sqlite3       │   │ in-memory Map             │
+│ FTS5, visibility,    │   │ zero external deps        │
+│ changesets           │   │                           │
+└──────────────────────┘   └──────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────────────────┐
+│  Filesystem                                         │
+│  Media roots (single or multi-root, symlink-safe)   │
+└─────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Installation
 
-`homelab-media-server` already declares it:
-
-```json
-// backend/package.json
-"@homelab/media-engine": "file:../../media-engine"
-```
-
-After pulling or editing `media-engine`, re-sync the copy in `backend/node_modules`:
-
 ```bash
-cd homelab-media-server/backend && npm install --silent
+npm install @homelab/media-engine
 ```
 
-The package is `private: true` and ESM-only (`"type": "module"`).
-
-Sub-path exports for the repository implementation:
-
-```js
-import { getVisibility, setVisibility } from '@homelab/media-engine/visibility';
-import { createChangeset } from '@homelab/media-engine/changeset';
-```
+> **Note**: The SQLite backend requires `better-sqlite3`. Install it as a peer dependency if you need persistence:
+>
+> ```bash
+> npm install better-sqlite3
+> ```
 
 ---
 
@@ -105,229 +113,356 @@ import { createChangeset } from '@homelab/media-engine/changeset';
 
 ```js
 import { MediaEngine, MediaScanner } from '@homelab/media-engine';
-import { SqliteMediaRepository } from './repository/sqliteMediaRepository.js';
-import db, { stmts } from './db.js';
+import { SqliteMediaRepository } from '@homelab/media-engine/repository/sqliteMediaRepository.js';
 
-const MEDIA_ROOT = (process.env.MEDIA_ROOT || '/home/CATIAA/homelab').split(':');
-const repository = new SqliteMediaRepository(db, stmts);
+// 1. Set up your repository (storage layer)
+const db = new Database('media.db'); // better-sqlite3
+const repository = new SqliteMediaRepository(db);
 
-// Single engine for the whole process (webId = visibility scope)
-const mediaEngine = new MediaEngine({ repository, mediaRoots: MEDIA_ROOT, webId: 'default' });
-globalThis.mediaEngine = mediaEngine;
-
-// Scanner — read/discovery only
-const mediaScanner = new MediaScanner({
+// 2. Create the engine (single instance per process)
+const engine = new MediaEngine({
   repository,
-  mediaRoots: MEDIA_ROOT,
-  callbacks: {
-    onNewFile: (fullPath, type) => queueThumbnail(fullPath, type),
-    broadcastStats: () => sseBroadcast(),
-  },
-  config: { workers: 4 },
+  mediaRoots: ['/path/to/media'],  // single or multiple roots
+  webId: 'default',                // visibility scope
 });
-globalThis.mediaScanner = mediaScanner;
-mediaScanner.startWatcher();
-await mediaScanner.scan();
-```
 
-**Route example (file serving):**
+// 3. Resolve a file by ID (returns metadata, NO paths)
+const file = await engine.resolve('abc123');
+console.log(file.name, file.size, file.mimeType);
 
-```js
-// backend/src/routes/file.js
-router.get('/:id', async (req, res) => {
-  const target = await globalThis.mediaEngine.getServeTarget(req.params.id);
-  if (target.error) return res.status(404).json({ error: 'File not found' });
-  res.sendFile(target.path, { headers: target.headers });
+// 4. Get a stream to serve the file
+const serveTarget = await engine.getServeTarget('abc123');
+// serveTarget.stream → Node.js Readable stream
+// serveTarget.headers → { 'Cache-Control': 'public, max-age=86400, immutable', 'Accept-Ranges': 'bytes' }
+res.sendFile?.(serveTarget.path, { headers: serveTarget.headers });
+// Or pipe the stream directly:
+serveTarget.stream.pipe(res);
+
+// 5. List files with visibility, pagination, and filtering
+const files = await engine.listFiles({
+  folderId: 'folder_xyz',
+  type: 'audio',
+  sortBy: 'name',
+  sortOrder: 'asc',
+  limit: 50,
+  cursor: 'next_page_token',
+});
+
+// 6. Search with full-text search
+const results = await engine.searchFiles('queen bohemian', {
+  type: 'audio',
+  limit: 20,
 });
 ```
 
 ---
 
-## API Reference
+## Core API Surface
 
 ### MediaEngine
 
-`new MediaEngine({ webId, repository, mediaRoots })`
+The main entry point. Owns all media logic; delegates persistence to the repository.
 
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `resolve` | `async resolve(fileId) → file \| {blocked:true} \| null` | DB lookup + `realpath` + `assertSafePath` + `isVisible` |
-| `getServeTarget` | `async getServeTarget(fileId) → {path, headers} \| {error}` | For `res.sendFile`; handles `not_found` / `not_available` (visibility) / `file_missing` |
-| `stat` | `async stat(fileId) → {size, mtime, exists} \| null` | Lightweight existence check |
-| `isVisible` | `isVisible(fileId) → boolean` | Visibility for `webId` |
-| `delete` / `restore` | `delete(fileId)`, `restore(fileId)` | Soft-delete via `media_visibility` (no FS) |
-| `trash` / `purge` / `move` / `rename` | `async *` | Stubs (`NOT_IMPLEMENTED`) — Phase 5/7 |
-| `listFiles` | `async listFiles({folderId, type, favoriteOnly, sortBy, sortOrder, limit, cursor, prevCursor})` | Visibility-joined pagination |
-| `searchFiles` | `async searchFiles(query, {type, folderId, scope, limit})` | FTS5 (`files_fts`) + visibility |
-| `searchFolders` | `async searchFolders(query, {scope, folderId, limit})` | `LIKE` on `folders.path` |
-| `getFileMetadata` | `async getFileMetadata(fileId)` | Full row + `dir_path` + visibility |
-| `updateMetadata` | `async updateMetadata(fileId, {isFavorite, isLocked, title, artist, album, genre, cover_source, lyrics, lyrics_synced, lyrics_romaji, youtube_id, video_offset})` | Whitelist-only, rejects unknown fields |
-| `getFolder` | `async getFolder(folderId)` | Normalized `{id, path, parentId, depth, fileCount, totalSize, ...}` |
-| `getFoldersByParent` | `async getFoldersByParent(parentId)` | Direct subfolders |
-| `getPreviewFilesForFolder` | `async getPreviewFilesForFolder(folderId, limit=4)` | For folder previews |
-| `getFolderGeneration` | `async getFolderGeneration(folderId)` | For binary index `ETag` |
-| `getStats` | `async getStats()` | `{totalFiles, byType}` visibility-aware |
-| `getBatchFiles` | `async getBatchFiles(ids)` | `{items, missingIds}` via `json_each` |
-| `resolveBatchFilenames` | `async resolveBatchFilenames(filenames)` | `name → id` map |
-| `getSearchSuggestions` | `async getSearchSuggestions(query)` | `LIKE` + visibility |
-| `listFavorites` | `async listFavorites()` | `is_favorite=1 AND type='audio'` |
-| `getChanges` / `createChangeset` / `finalizeChangeset` / `addToChangeset` / `inspectChangeset` / `listChangesets` / `preflightApply` / `applyChangeset` | changeset promotion | Delegates to repository |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `resolve(fileId)` | `File \| { blocked: true } \| null` | Resolve metadata. Strips filesystem paths. Checks visibility. |
+| `openMedia(fileId)` | `{ stream, mimeType, size, etag, lastModified }` | Open a readable stream for the media file. |
+| `getServeTarget(fileId)` | `{ stream, size, mimeType, etag, lastModified, headers } \| { error }` | Ready-to-use response object for HTTP serving. |
+| `stat(fileId)` | `{ size, mtime, exists } \| null` | Lightweight existence check without streaming. |
+| `isVisible(fileId)` | `boolean` | Check visibility for the current `webId`. |
+| `delete(fileId)` | `OperationResult` | Soft-delete (marks as deleted for this `webId`). |
+| `restore(fileId)` | `OperationResult` | Restore a soft-deleted file. |
+| `listFiles(options)` | `{ items, nextCursor, hasMore }` | Paginated, visibility-filtered file listing. |
+| `searchFiles(query, options)` | `{ items, total? }` | FTS5-powered search, visibility-filtered. |
+| `searchFolders(query, options)` | `Folder[]` | Folder path search. |
+| `getFileMetadata(fileId)` | `FileMetadata` | Full metadata including dir_path, visibility, and custom fields. |
+| `updateMetadata(fileId, updates)` | `boolean` | Whitelist-safe metadata updates. |
+| `getStats()` | `{ totalFiles, byType }` | Visibility-aware statistics. |
+| `getBatchFiles(ids)` | `{ items, missingIds }` | Efficient batch lookup by ID list. |
+| `getChanges(sinceTimestamp)` | `Change[]` | Get visibility changes since a timestamp (for sync). |
 
-Missing visibility rows are treated as `PRESENT` (`LEFT JOIN ... OR IS NULL`), matching `getVisibility` fallback.
+### Streaming / Resource Model
 
-### MediaScanner
-
-`new MediaScanner({ repository, mediaRoots, callbacks, config })`
-
-| Method | Description |
-|--------|-------------|
-| `scan()` | `incrementalSync` — compare `scanFileSystem` vs `findByDirPattern` (5000-row batches, `setImmediate` yield), `upsertFile`/`deleteFileById` via repository |
-| `startWatcher()` | `fs.watch` per root (recursive) + 15-min periodic + 2s debounced rescan (30s grace) |
-| `stopWatcher()` | Close watchers + intervals |
-| `pause()` / `resume()` | `adaptiveController` calls on CPU >90% / mem <10% |
-| `getStatus()` | `{isScanning, isPaused, isWatcherRunning, pendingRescan}` |
-| `ensureFolder(path)` | `repository.ensureFolder` |
-| `events` | `EventBus` (`scan.started`, `scan.completed`, `scan.error`, `scanner.paused`) |
-
-Callbacks: `onNewFile`, `onFileUpdated` (thumb + FTS + recursive counts), `onFileDeleted`, `getBatchSize`, `shouldCompareByHash`, `recordMemoryUsage`, `buildThumbCache`, `broadcastStats`.
-
-### MediaRepository
-
-Abstract interface (`src/repository/MediaRepository.js` — 56 methods). Backend implements `SqliteMediaRepository` (`backend/src/repository/sqliteMediaRepository.js`, 622 lines) via `stmts` + `db.prepare`. Key groups: file/folder core, folder queries, visibility, changesets, file queries (visibility-joined), aggregation (scanner).
-
-Raw escape hatches `query`/`queryOne`/`run`/`transaction` remain for transition (e.g. binary index).
-
-### MockMediaRepository
-
-`src/repository/MockMediaRepository.js` — in-memory implementation for tests (no SQLite).
+The engine returns **opaque resources**, never raw filesystem paths:
 
 ```js
+// ❌ NEVER: your app builds paths from user input
+const path = `/media/${req.params.id}.mp3`;
+res.sendFile(path); // ← path traversal risk!
+
+// ✅ ALWAYS: your app asks the engine for a resource
+const target = await engine.getServeTarget(req.params.id);
+if (target.error) return res.status(404).json({ error: target.error });
+res.sendFile(target.path, { headers: target.headers });
+// Or, for streaming frameworks:
+target.stream.pipe(response);
+```
+
+The `getServeTarget()` contract:
+
+```ts
+interface ServeTarget {
+  stream: ReadableStream;        // Node.js readable stream
+  size: number;                  // file size in bytes
+  mimeType: string;              // e.g. 'audio/flac', 'video/mp4'
+  etag: string;                  // file ID for cache validation
+  lastModified: number;          // unix timestamp
+  headers: Record<string, string>; // Cache-Control, Accept-Ranges
+  path?: string;                 // optional absolute path (for res.sendFile)
+}
+```
+
+The `resolve()` contract (metadata only, no paths):
+
+```ts
+interface ResolvedFile {
+  id: string;
+  name: string;
+  type: 'audio' | 'video' | 'image';
+  size: number;
+  mtime: number;
+  mimeType: string;
+  dirPath: string;      // normalized directory path, no filesystem root
+  ext: string;
+  exists: boolean;
+  // NO fullPath, NO absolute path
+}
+```
+
+---
+
+## Safety & Security
+
+### Path Traversal Protection
+
+All path resolution goes through `assertSafePath()`:
+
+1. **Rejects `..` sequences** in user-supplied relative paths
+2. **Rejects null bytes** (`\0`) and absolute paths
+3. **Symlink-aware canonicalization** — `realpath()` resolves symlinks, then validates the canonical path stays within allowed roots
+4. **Multi-root support** — searches across multiple media roots
+
+```js
+import { assertSafePath } from '@homelab/media-engine';
+
+// Throws PATH_ESCAPE if canonical path is outside media roots
+assertSafePath(canonicalPath, mediaRoots, relPath);
+```
+
+### Visibility Controls
+
+Each user (`webId`) has independent visibility state. Files are never hard-deleted by default:
+
+```js
+// Soft-delete for user "alice"
+await engine.delete(fileId); // → { state: 'DELETED', changeId: 'ch_xxx' }
+
+// Restore for user "alice"
+await engine.restore(fileId); // → { state: 'PRESENT', changeId: 'ch_yyy' }
+
+// Check visibility
+engine.isVisible(fileId); // → true / false
+
+// File is invisible in engine.listFiles() and engine.searchFiles()
+// when the current webId has it marked as DELETED
+```
+
+---
+
+## Scanner
+
+The incremental filesystem scanner discovers and syncs your media library:
+
+```js
+const scanner = new MediaScanner({
+  repository,
+  mediaRoots: ['/media/music', '/media/videos'],
+  callbacks: {
+    onNewFile: (fullPath, type) => generateThumbnail(fullPath, type),
+    onFileUpdated: () => rebuildSearchIndex(),
+    onFileDeleted: (fileId) => purgeCache(fileId),
+    broadcastStats: () => io.emit('stats', scanner.getStatus()),
+  },
+  config: {
+    workers: 4,              // parallel scanning workers
+    periodicMinutes: 15,     // full rescan interval
+    scanRecursive: true,     // recurse into subdirectories
+  },
+});
+
+// Start filesystem watcher (fs.watch + periodic rescan)
+scanner.startWatcher();
+
+// Run an incremental sync
+const result = await scanner.scan();
+// → { inserted, updated, deleted, duration, errors }
+
+// Pause during high load
+scanner.pause();
+
+// Resume
+scanner.resume();
+
+// Status
+scanner.getStatus();
+// → { isScanning, isPaused, isWatcherRunning, pendingRescan }
+```
+
+**Event Bus** — subscribe to scanner lifecycle events:
+
+```js
+engine.events.on('scan.started', (e) => console.log('Scan started', e.timestamp));
+engine.events.on('scan.completed', (e) => console.log('Scan completed', e));
+engine.events.on('scan.error', (e) => console.error('Scan error', e.error));
+engine.events.on('scanner.paused', (e) => console.log('Scanner paused', e.timestamp));
+engine.events.on('scanner.resumed', (e) => console.log('Scanner resumed', e.timestamp));
+```
+
+---
+
+## Repository Pattern
+
+The repository interface decouples the engine from storage. Swap SQLite for PostgreSQL, in-memory for tests, or a remote API:
+
+```js
+// The interface (56 methods)
+class MediaRepository {
+  // File operations
+  getFileById(id)
+  getFileWithPath(id)
+  upsertFile(file)
+  deleteFileById(id)
+
+  // Folder operations
+  getFolderById(id)
+  ensureFolder(path)
+  getFoldersByParent(parentId)
+
+  // Visibility
+  ensureVisibilityTables()
+  isVisible(fileId, webId)
+  setVisibilityState(fileId, webId, state)
+
+  // Changesets
+  ensureChangesetTables()
+  createChangeset(webId, name, description)
+  applyChangeset(changesetId, targetWebId)
+
+  // Queries
+  listFiles({ webId, folderId, type, limit, cursor })
+  searchFiles({ webId, query, type, limit })
+  getStats(webId)
+  getBatchFiles(ids, webId)
+
+  // Raw escape hatches (for migration/transitions)
+  query(sql, params)
+  transaction(fn)
+}
+```
+
+**Built-in implementations:**
+
+| Repository | Use Case |
+|------------|----------|
+| `SqliteMediaRepository` | Production SQLite via `better-sqlite3` |
+| `MockMediaRepository` | In-memory testing, no external deps |
+
+```js
+// Test with mock — zero dependencies
 import { MediaEngine, MockMediaRepository } from '@homelab/media-engine';
+
 const repo = new MockMediaRepository();
 const engine = new MediaEngine({ repository: repo, mediaRoots: ['/media'], webId: 'test' });
+
 repo.ensureFolder('Music');
-repo.upsertFile({ id: '1', name: 'a.flac', type: 'audio', dir_id: repo.ensureFolder('Music'), size: 1000, mtime: Date.now() });
-await engine.listFiles({ limit: 10 }); // → 1 item
+repo.upsertFile({
+  id: '1',
+  name: 'song.flac',
+  type: 'audio',
+  dir_id: repo.ensureFolder('Music'),
+  size: 5000000,
+  mtime: Date.now(),
+});
+
+await engine.listFiles({ limit: 10 }); // → [{ id: '1', name: 'song.flac', ... }]
 ```
 
-### Scanner Utilities
+---
 
-| Export | Source | Description |
-|--------|--------|-------------|
-| `VIDEO_EXTS`, `AUDIO_EXTS`, `IMAGE_EXTS`, `detectType(ext)` | `scanner/constants.js` | Extension sets, type detection |
-| `getFileId(relPath)`, `resolveFullPath(relPath, mediaRoots)`, `getRelPath(fullPath, mediaRoots)`, `computeContentHash` | `scanner/fileUtils.js` | `md5(relPath)` id, multi-root join, symlink-tolerant |
-| `scanFileSystem(root, folderName)`, `streamFileSystem` | `scanner/walk.js` | Recursive `readdir` (async) |
-| `getDuration`, `probeVideoMetadata`, `extractTags`, `parseTimestamp` | `scanner/probe.js` | `ffprobe` wrappers |
-| `incrementalSync`, `enrichDurationsBatch`, `enrichMetadataBatch` | `scanner/sync.js` | Batch diff + `ffprobe` enrichment |
-
-### Safety Guards
-
-| Export | Source | Description |
-|--------|--------|-------------|
-| `assertSafePath(canonical, mediaRoots, relPath)` | `safety/pathGuard.js` | Throws `PATH_ESCAPE` if canonical escapes roots (symlink-aware fallback in `resolveFile`) |
-| `assertVisible` | `safety/visibilityGuard.js` | Visibility guard |
-
-`resolveFile` catches `PATH_ESCAPE` when `relPath` is scanner-controlled (no `..`) — allows symlinked roots like `homelab/Music → /home/CATIAA/Music`.
-
-### Visibility & Changesets
-
-Re-exported from `src/index.js`:
+## Subpath Exports
 
 ```js
-import { ensureTables, getVisibility, setVisibility, isVisible, getChanges } from '@homelab/media-engine';
-import { ensureChangesetTables, createChangeset, finalizeChangeset, addChangeToChangeset, getChangeset, listChangesets, applyChangeset, validatePromotionPath, detectConflicts, ENVIRONMENT_ORDER } from '@homelab/media-engine';
+// Main engine
+import { MediaEngine, MediaScanner } from '@homelab/media-engine';
+
+// Visibility (soft-delete, user-scoped)
+import { getVisibility, setVisibility, isVisible, getChanges } from '@homelab/media-engine';
+
+// Changesets (cross-environment promotion)
+import {
+  createChangeset,
+  finalizeChangeset,
+  addChangeToChangeset,
+  listChangesets,
+  applyChangeset,
+  validatePromotionPath,
+  detectConflicts,
+  ENVIRONMENT_ORDER,
+} from '@homelab/media-engine';
 ```
-
-`ENVIRONMENT_ORDER = { beta:0, 'pre-release':1, pre:1, release:2 }` — sequential promotion only.
-
-### Operations
-
-| Export | Source | Description |
-|--------|--------|-------------|
-| `OperationLock` | `operations/lock.js` | Per-`fileId` async lock for `trash`/`purge`/`move`/`rename` |
-| `createOperationResult`, `successResult`, `errorResult` | `operations/result.js` | `{ok, operation, code, fileId, previousState, newState}` |
-
-`trash`/`purge`/`move`/`rename` acquire `OperationLock` then delegate (currently `NOT_IMPLEMENTED`).
-
-### Events
-
-`EventBus` (`src/events/EventBus.js`) — typed emitter for `scan.*`, `scanner.paused/resumed`; backend subscribes for SSE + thumbnail.
 
 ---
 
-## File → Web Path
+## Project Status
 
-```
-File on disk  (/home/CATIAA/homelab/Music/a.flac  — via symlink homelab/Music → /home/CATIAA/Music)
-  → MediaScanner.scan()  →  scanFileSystem → find 113k files → incrementalSync → repository.upsertFile
-  → frontend GET /api/files?folder_id=...  →  engine.listFiles()  →  SQLite (LEFT JOIN visibility)
-  → frontend GET /stream/audio/:id  →  engine.resolve(id)  →  {fullPath, exists, blocked}
-  → backend  res.sendFile(fullPath, {headers: getServeTarget().headers})  →  browser
-```
+**Version: 0.1.0** — Early production-ready release.
 
-Search: `files_fts` (FTS5 `unicode61 remove_diacritics 1`) + triggers (`files_ai/ad/au`) + `engine.searchFiles` (visibility-filtered).
-
-All media file resolution goes through `MediaEngine` — `fileResolver.js` is deleted, zero `grep` hits in `backend/src`.
-
----
-
-## Visibility Semantics
-
-- Table `media_visibility(file_id, web_id, state, updated_at)` — PK `(file_id, web_id)`
-- Missing row = `PRESENT` (both `getVisibility` fallback and `LEFT JOIN ... OR IS NULL` in `listFiles`/`searchFiles`/`getStats`/etc.)
-- `state = 'DELETED'` → hidden from `listFiles`, `searchFiles`, `getSearchSuggestions`, `listFavorites`, `getBatchFiles`, `resolve` returns `{blocked:true}`
-- `delete(fileId)` / `restore(fileId)` are soft (no FS), changeset promotion is explicit
-
----
-
-## Filesystem Safety
-
-- `resolveFile` does `join(mediaRoots[0], relPath)` → `realpath` → `assertSafePath`
-- Symlinked roots are allowed when `relPath` is safe (no `..`, no leading `/`, no `\0`)
-- All operations must go through `resolveFile`; direct `join(MEDIA_ROOT, relPath)` in routes is forbidden
-
----
-
-## Project Structure
-
-```
-@media/homelab/media-engine/
-├── package.json          # private, ESM, exports ".", "./visibility", "./changeset"
-├── plan.md               # 13-phase production plan + transaction strategy
-├── src/
-│   ├── index.js          # barrel (50 exports)
-│   ├── MediaEngine.js    # 244 lines, no direct DB
-│   ├── MediaScanner.js   # 205 lines, watch + periodic
-│   ├── scanner/          # constants, fileUtils, walk, probe, sync
-│   ├── resolver/         # resolveFile
-│   ├── safety/           # pathGuard, visibilityGuard
-│   ├── visibility/       # visibility (soft-delete), changeset (promotion)
-│   ├── operations/       # result, lock (trash/purge/move/rename stubs)
-│   ├── events/           # EventBus
-│   └── repository/       # MediaRepository (interface), MockMediaRepository
-└── README.md
-```
+| Component | Status |
+|-----------|--------|
+| Path resolution & safety guards | Stable |
+| Visibility (per-user soft delete) | Stable |
+| Incremental scanner + watcher | Stable |
+| SQLite repository | Stable |
+| Changeset promotion | Stable |
+| FTS search | Stable |
+| Cursor pagination | Stable |
+| Batch operations | Stable |
+| trash / purge / move / rename | Stubs (coming in 0.2.0) |
 
 ---
 
 ## Testing
 
 ```bash
-# Sync validation (113k files)
-node test/smoke-test-scanner.mjs
-# → Files: 113903, Folders: 159, scan 0 inserted (DB in sync), pause/resume, EventBus — 0 mismatches
+# Run unit tests
+npm test
 
-# Mock (no SQLite)
-node -e "import {MediaEngine, MockMediaRepository} from './src/index.js'; const r=new MockMediaRepository(); const e=new MediaEngine({repository:r, mediaRoots:['/media'], webId:'test'}); ..."
+# Mock-based tests (no SQLite required)
+node --test src/**/*.test.js
+
+# Integration with SQLite
+node --test tests/**/*.test.js
 ```
 
-`SqliteMediaRepository` vs `MockMediaRepository` — same contract, engine is DB-agnostic.
+The `MockMediaRepository` allows full engine testing without any external dependencies.
+
+---
+
+## Requirements
+
+- **Node.js** >= 18.0.0
+- **ESM** only (`"type": "module"`)
+- `better-sqlite3` (optional, only for SQLite backend)
+
+---
+
+## License
+
+MIT
 
 ---
 
 ## Related
 
-- Consumer: [`homelab-media-server`](../homelab-media-server) (`file:../../media-engine` in `backend/package.json`)
-- Docs: `homelab-media-server/README.md`, `homelab-media-server/ARCHITECTURE.md`
-- Version: `0.1.0` — `trash`/`purge`/`move`/`rename` are stubs (Phase 5/7)
-
+- **Consumer example**: [homelab-media-server](https://github.com/your-org/homelab-media-server) — real-world Express integration
+- **Architecture docs**: See `ARCHITECTURE.md` for the boundary model and design rationale
