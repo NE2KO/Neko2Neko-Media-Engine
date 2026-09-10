@@ -1,6 +1,7 @@
 export { MediaEngine } from './MediaEngine.js';
 export { MediaScanner } from './MediaScanner.js';
 export { EventBus } from './events/EventBus.js';
+export { loadConfig } from './config/loader.js';
 
 export { resolveFile, resolveFileForEngine } from './resolver/resolveFile.js';
 

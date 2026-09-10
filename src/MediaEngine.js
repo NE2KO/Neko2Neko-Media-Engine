@@ -6,6 +6,9 @@ import { errorResult } from './operations/result.js';
 import { validatePromotionPath, detectConflicts, ENVIRONMENT_ORDER } from './visibility/changeset.js';
 import { scanFileSystem } from './scanner/walk.js';
 import { AUDIO_EXTS, VIDEO_EXTS, IMAGE_EXTS } from './scanner/constants.js';
+import path from 'node:path';
+import { createHmac } from 'node:crypto';
+import { loadConfig } from './config/loader.js';
 
 const MIME_MAP = {
   '.mp4': 'video/mp4',
@@ -27,15 +30,64 @@ const MIME_MAP = {
 const STRIPPED_FIELDS = new Set(['fullPath']);
 
 export class MediaEngine {
-  constructor({ webId, repository, mediaRoots }) {
+  constructor({ configPath, webId, repository, mediaRoots }) {
+    if (configPath) {
+      this.config = loadConfig(configPath);
+      this.secretKey = this.config.global.secretKey;
+      this._policies = this.config.policies;
+      this.webId = null;
+      this.repository = repository || null;
+      this.mediaRoots = Array.isArray(mediaRoots) ? mediaRoots : mediaRoots ? [mediaRoots] : [];
+      this.events = new EventBus();
+      this._locks = new OperationLock();
+      return;
+    }
+
     this.webId = webId || null;
     this.repository = repository;
     this.mediaRoots = Array.isArray(mediaRoots) ? mediaRoots : [mediaRoots];
     this.events = new EventBus();
     this._locks = new OperationLock();
+    this._policies = new Map();
+    this.secretKey = null;
     if (webId) {
       this.repository.ensureVisibilityTables();
       this.repository.ensureChangesetTables();
+    }
+  }
+
+  _getPolicy(webId) {
+    if (!this._policies || this._policies.size === 0) return null;
+    return this._policies.get(webId) || null;
+  }
+
+  _generateToken(fileId, webId) {
+    const exp = Math.floor(Date.now() / 1000) + 300;
+    const payload = JSON.stringify({ id: fileId, web: webId, exp });
+    const signature = createHmac('sha256', this.secretKey).update(payload).digest('hex');
+    return `${Buffer.from(payload).toString('base64url')}:${signature}`;
+  }
+
+  _verifyToken(token) {
+    try {
+      const [payloadB64, signature] = token.split(':');
+      if (!payloadB64 || !signature) throw new Error('Invalid token format');
+
+      const payloadStr = Buffer.from(payloadB64, 'base64url').toString('utf-8');
+      const payload = JSON.parse(payloadStr);
+
+      if (Date.now() / 1000 > payload.exp) {
+        return { valid: false, reason: 'Token expired' };
+      }
+
+      const expectedSig = createHmac('sha256', this.secretKey).update(payloadStr).digest('hex');
+      if (signature !== expectedSig) {
+        return { valid: false, reason: 'Invalid signature' };
+      }
+
+      return { valid: true, payload };
+    } catch (err) {
+      return { valid: false, reason: err.message };
     }
   }
 
@@ -99,7 +151,13 @@ export class MediaEngine {
     };
   }
 
-  async getServeTarget(fileId) {
+  async getServeTarget(fileId, webId) {
+    const targetWebId = webId || this.webId;
+
+    if (this._policies && this._policies.size > 0) {
+      return this._getServeTargetWithPolicy(fileId, targetWebId);
+    }
+
     const file = await this.resolve(fileId);
     if (!file) return { error: 'not_found' };
     if (file.blocked) return { error: 'not_available' };
@@ -118,6 +176,114 @@ export class MediaEngine {
         'Accept-Ranges': 'bytes',
       },
     };
+  }
+
+  async _getServeTargetWithPolicy(fileId, webId) {
+    const policy = this._getPolicy(webId);
+    if (!policy) {
+      return { error: 'FORBIDDEN', reason: 'Web app tidak terdaftar' };
+    }
+
+    const file = await resolveFile(fileId, this.repository, this.mediaRoots);
+    if (!file) {
+      return { error: 'not_found', reason: 'File tidak ditemukan' };
+    }
+    if (!file.exists) {
+      return { error: 'file_missing', reason: 'File tidak ada di filesystem' };
+    }
+
+    const isAllowed = policy.allowedRoots.some(root => {
+      const normalized = path.normalize(root);
+      return file.fullPath === normalized || file.fullPath.startsWith(normalized + path.sep);
+    });
+    if (!isAllowed) {
+      return { error: 'FORBIDDEN', reason: 'Path tidak diizinkan oleh policy' };
+    }
+
+    const mimeType = this._guessMimeType(file.ext);
+    if (!policy.types.includes(mimeType)) {
+      return { error: 'FORBIDDEN', reason: 'Tipe file tidak diizinkan' };
+    }
+
+    if (!this.repository.isVisible(fileId, policy.webIdScope)) {
+      return { error: 'not_available', reason: 'File tidak visible' };
+    }
+
+    const token = this._generateToken(fileId, webId);
+    return {
+      success: true,
+      streamUrl: `/api/stream?token=${token}`,
+      metadata: { mimeType, size: file.size },
+    };
+  }
+
+  async handleStreamRequest(token, req, res) {
+    const verification = this._verifyToken(token);
+    if (!verification.valid) {
+      return res.status(401).json({ error: 'UNAUTHORIZED', reason: verification.reason });
+    }
+
+    const { fileId, webId } = verification.payload;
+    const policy = this._getPolicy(webId);
+    if (!policy) {
+      return res.status(403).json({ error: 'FORBIDDEN' });
+    }
+
+    const file = await resolveFile(fileId, this.repository, this.mediaRoots);
+    if (!file || !file.exists) {
+      return res.status(404).json({ error: 'NOT_FOUND' });
+    }
+
+    const isAllowed = policy.allowedRoots.some(root => {
+      const normalized = path.normalize(root);
+      return file.fullPath === normalized || file.fullPath.startsWith(normalized + path.sep);
+    });
+    if (!isAllowed) {
+      return res.status(403).json({ error: 'FORBIDDEN' });
+    }
+
+    const mimeType = this._guessMimeType(file.ext);
+    if (!policy.types.includes(mimeType)) {
+      return res.status(403).json({ error: 'FORBIDDEN' });
+    }
+
+    if (!this.repository.isVisible(fileId, policy.webIdScope)) {
+      return res.status(403).json({ error: 'FORBIDDEN' });
+    }
+
+    const { createReadStream, existsSync } = await import('node:fs');
+    if (!existsSync(file.fullPath)) {
+      return res.status(404).json({ error: 'NOT_FOUND' });
+    }
+
+    const fileSize = file.size;
+    const range = req.headers.range;
+
+    if (range) {
+      const parts = range.replace(/bytes=/, '').split('-');
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const chunkSize = (end - start) + 1;
+
+      res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunkSize,
+        'Content-Type': mimeType,
+        'Cache-Control': 'no-store',
+      });
+
+      const stream = createReadStream(file.fullPath, { start, end });
+      stream.pipe(res);
+    } else {
+      res.writeHead(200, {
+        'Content-Length': fileSize,
+        'Content-Type': mimeType,
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'no-store',
+      });
+      createReadStream(file.fullPath).pipe(res);
+    }
   }
 
   async stat(fileId) {

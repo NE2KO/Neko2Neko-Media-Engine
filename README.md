@@ -4,9 +4,9 @@
 [![ESM](https://img.shields.io/badge/ESM-only-blue)](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](#license)
 
-**The single security boundary between your web application and the filesystem for all media operations.**
+**The single security boundary between your web applications and the filesystem for all media operations.**
 
-`@homelab/media-engine` is a production-grade Node.js library that owns the complete media lifecycle: discovery, safe resolution, visibility management, streaming, and storage. Your web layer never touches media paths, the filesystem, or storage internals — it asks the engine.
+`@homelab/media-engine` is a production-grade Node.js library and standalone gateway service. It owns the complete media lifecycle: discovery, safe resolution, visibility management, streaming, and storage. Your web layer never touches media paths, the filesystem, or storage internals — it asks the engine.
 
 ---
 
@@ -40,8 +40,11 @@ The backend stays **filesystem-blind**. It receives streams, metadata objects, a
 |---------|---------|
 | **Single Media Boundary** | Only the engine touches media paths. Web apps use opaque IDs. |
 | **Path Traversal Protection** | Symlink-aware canonicalization, `..` rejection, null-byte guards. |
-| **Per-User Visibility** | Soft-delete per user (webId). Deleted for one user, visible to another. |
-| **Cross-Environment Changesets** | Promote media changes across environments (beta → pre → release). |
+| **Per-User Visibility** | Soft-delete per user (`webId`). Deleted for one user, visible to another. |
+| **Cross-Environment Changesets** | Promote media changes across environments (`beta` → `pre` → `release`). |
+| **Multi-Web Gateway** | Single engine instance serves multiple web apps with per-app policies. |
+| **Token-Based Streaming** | Signed, time-limited stream tokens. Web apps never see real paths. |
+| **HTTP Range Requests** | `206 Partial Content` support for video seeking in browsers. |
 | **Streaming-First API** | Returns Node.js Readable streams with correct MIME types and cache headers. |
 | **Incremental Scanner** | Efficient filesystem discovery with debounced watcher, periodic rescan, and adaptive CPU backpressure. |
 | **FTS Search** | Full-text search via FTS5, visibility-filtered, with cursor pagination. |
@@ -55,42 +58,41 @@ The backend stays **filesystem-blind**. It receives streams, metadata objects, a
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Web Application (Express, Fastify, Hono, etc.)     │
-│  Uses: engine.resolve(), engine.getServeTarget()     │
-│        engine.listFiles(), engine.openMedia()        │
-└──────────────────────┬──────────────────────────────┘
-                       │ opaque IDs, streams, metadata
-                       ▼
-┌─────────────────────────────────────────────────────┐
-│  MediaEngine                                        │
-│  • resolve(fileId) → metadata (no paths)            │
-│  • openMedia(fileId) → { stream, mimeType, size }   │
-│  • getServeTarget(fileId) → { stream, headers }     │
-│  • listFiles() / searchFiles() / getStats()         │
-│  • Visibility guard, changeset promotion             │
-│  • Path validation (assertSafePath)                  │
-└──────────────────────┬──────────────────────────────┘
-                       │ repository interface calls
-                       ▼
-┌─────────────────────────────────────────────────────┐
-│  MediaRepository (interface)                         │
-│  getFileById, upsertFile, isVisible, listFiles, ... │
-└──────────────┬──────────────────────┬────────────────┘
-               │                      │
-               ▼                      ▼
-┌──────────────────────┐   ┌──────────────────────────┐
-│ SqliteRepository     │   │ MockRepository (tests)    │
-│ better-sqlite3       │   │ in-memory Map             │
-│ FTS5, visibility,    │   │ zero external deps        │
-│ changesets           │   │                           │
-└──────────────────────┘   └──────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────────────────┐
-│  Filesystem                                         │
-│  Media roots (single or multi-root, symlink-safe)   │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  Web Application A (Movies) ───┐                     │
+│  Web Application B (Music) ─────┤                     │
+│  Web Application C (Admin) ─────┼──→ MediaEngine     │
+│                                 │   (singleton)       │
+│                                 │                     │
+│  Each web app has its own:      │  • resolve()        │
+│  - URL path prefix              │  • getServeTarget() │
+│  - allowed_roots                │  • listFiles()      │
+│  - allowed MIME types           │  • searchFiles()    │
+│  - visibility scope (webId)     │  • token streaming  │
+│                                 │  • range requests   │
+│                                 │  • policy enforce   │
+└─────────────────────────────────┴───────┬────────────┘
+                                          │ repository interface calls
+                                          ▼
+                            ┌──────────────────────────┐
+                            │  MediaRepository         │
+                            │  (interface)             │
+                            └──────────┬───────────────┘
+                                       │
+                    ┌──────────────────┴──────────────────┐
+                    ▼                                      ▼
+        ┌──────────────────────┐               ┌──────────────────────────┐
+        │ SqliteRepository     │               │ MockRepository (tests)    │
+        │ better-sqlite3       │               │ in-memory Map             │
+        │ FTS5, visibility,    │               │ zero external deps        │
+        │ changesets           │               │                           │
+        └──────────────────────┘               └──────────────────────────┘
+                    │
+                    ▼
+        ┌─────────────────────────────────────────────────────┐
+        │  Filesystem                                         │
+        │  Media roots (single or multi-root, symlink-safe)   │
+        └─────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -111,49 +113,136 @@ npm install @homelab/media-engine
 
 ## Quick Start
 
+### Multi-Web Gateway Mode (Recommended)
+
+Run the engine as a central service. Multiple web apps connect to a single instance.
+
+```js
+import { MediaEngine, MediaScanner, loadConfig } from '@homelab/media-engine';
+import { SqliteMediaRepository } from '@homelab/media-engine/repository/sqliteMediaRepository.js';
+
+// 1. Load config from TOML
+const { global, policies } = loadConfig('./config.toml');
+
+// 2. Set up repository
+const db = new Database('media.db');
+const repository = new SqliteMediaRepository(db);
+
+// 3. Create engine in multi-web mode
+const engine = new MediaEngine({
+  configPath: './config.toml',
+  repository,
+  mediaRoots: ['/mnt/media'],
+});
+
+// 4. Web app asks for stream URL (no paths leaked)
+const result = await engine.getServeTarget('movie123', 'movies');
+// → { success: true, streamUrl: '/api/stream?token=eyJpZCI6Im1vdmllMTIz...', metadata: { mimeType: 'video/mp4', size: 1500000000 } }
+
+// 5. Client requests stream with signed token
+app.get('/api/stream', async (req, res) => {
+  await engine.handleStreamRequest(req.query.token, req, res);
+});
+```
+
+### Legacy Single-Web Mode
+
+For simple single-app deployments:
+
 ```js
 import { MediaEngine, MediaScanner } from '@homelab/media-engine';
 import { SqliteMediaRepository } from '@homelab/media-engine/repository/sqliteMediaRepository.js';
 
-// 1. Set up your repository (storage layer)
-const db = new Database('media.db'); // better-sqlite3
+const db = new Database('media.db');
 const repository = new SqliteMediaRepository(db);
 
-// 2. Create the engine (single instance per process)
+// Single web app, direct stream return
 const engine = new MediaEngine({
+  webId: 'default',
   repository,
-  mediaRoots: ['/path/to/media'],  // single or multiple roots
-  webId: 'default',                // visibility scope
+  mediaRoots: ['/path/to/media'],
 });
 
-// 3. Resolve a file by ID (returns metadata, NO paths)
+// Resolve metadata (no paths)
 const file = await engine.resolve('abc123');
 console.log(file.name, file.size, file.mimeType);
 
-// 4. Get a stream to serve the file
+// Get stream directly
 const serveTarget = await engine.getServeTarget('abc123');
-// serveTarget.stream → Node.js Readable stream
-// serveTarget.headers → { 'Cache-Control': 'public, max-age=86400, immutable', 'Accept-Ranges': 'bytes' }
-res.sendFile?.(serveTarget.path, { headers: serveTarget.headers });
-// Or pipe the stream directly:
 serveTarget.stream.pipe(res);
-
-// 5. List files with visibility, pagination, and filtering
-const files = await engine.listFiles({
-  folderId: 'folder_xyz',
-  type: 'audio',
-  sortBy: 'name',
-  sortOrder: 'asc',
-  limit: 50,
-  cursor: 'next_page_token',
-});
-
-// 6. Search with full-text search
-const results = await engine.searchFiles('queen bohemian', {
-  type: 'audio',
-  limit: 20,
-});
 ```
+
+---
+
+## Configuration
+
+### `config.toml`
+
+Create a `config.toml` in your engine working directory:
+
+```toml
+[global]
+thumbnail_root = "/home/CATIAA/Engine/thumbnails"
+scan_period_minutes = 15
+scan_batch_size = 250
+startup_grace_ms = 30000
+probe_timeout = 15000
+
+# HMAC secret for signing stream tokens.
+# Generate with: openssl rand -hex 32
+secret_key = "dev-only-change-in-production"
+
+# ---------------------------------------------------------------------------
+# Web policies: each section defines one web app that may access the engine.
+# The engine enforces these policies on every stream request.
+# ---------------------------------------------------------------------------
+
+[web.movies]
+path = "/app/movies"
+allowed_roots = ["/mnt/media/movies"]
+types = ["video/mp4", "video/x-matroska", "video/webm", "video/quicktime"]
+# web_id is the visibility scope for soft-delete checks.
+# If omitted, defaults to the section name ("movies").
+web_id = "release-movies"
+
+[web.music]
+path = "/app/music"
+allowed_roots = ["/mnt/media/music"]
+types = ["audio/mpeg", "audio/flac", "audio/wav", "audio/ogg", "audio/aac", "image/jpeg", "image/png"]
+web_id = "release-music"
+
+[web.admin]
+path = "/app/admin"
+allowed_roots = ["/mnt/media"]
+types = ["video/mp4", "video/x-matroska", "audio/mpeg", "audio/flac", "image/jpeg", "image/png", "application/octet-stream"]
+web_id = "admin"
+```
+
+| Field | Description |
+|-------|-------------|
+| `global.secret_key` | HMAC secret for signing stream tokens. Use `openssl rand -hex 32` for production. |
+| `global.thumbnail_root` | Central thumbnail cache directory. |
+| `global.scan_period_minutes` | Scanner interval. |
+| `global.scan_batch_size` | Files per batch during incremental sync. |
+| `global.startup_grace_ms` | Ignore watcher events for this duration after startup. |
+| `global.probe_timeout` | Default ffprobe timeout in milliseconds. |
+| `web.<id>.path` | URL path prefix for this web app. |
+| `web.<id>.allowed_roots` | Filesystem roots this web app may access. |
+| `web.<id>.types` | Allowed MIME types. |
+| `web.<id>.web_id` | Visibility scope (soft-delete namespace). Defaults to section name if omitted. |
+
+### `loadConfig()`
+
+```js
+import { loadConfig } from '@homelab/media-engine';
+
+const config = loadConfig('./config.toml');
+// config.global.secretKey
+// config.global.thumbnailRoot
+// config.policies → Map<webId, { path, allowedRoots, types, webIdScope }>
+```
+
+Throws if `config.toml` is missing or `[global] secret_key` is absent.
 
 ---
 
@@ -165,9 +254,10 @@ The main entry point. Owns all media logic; delegates persistence to the reposit
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `resolve(fileId)` | `File \| { blocked: true } \| null` | Resolve metadata. Strips filesystem paths. Checks visibility. |
+| `resolve(fileId)` | `ResolvedFile \| { blocked: true } \| null` | Resolve metadata. Strips filesystem paths. Checks visibility. |
 | `openMedia(fileId)` | `{ stream, mimeType, size, etag, lastModified }` | Open a readable stream for the media file. |
-| `getServeTarget(fileId)` | `{ stream, size, mimeType, etag, lastModified, headers } \| { error }` | Ready-to-use response object for HTTP serving. |
+| `getServeTarget(fileId, webId?)` | `StreamTarget \| TokenTarget \| { error }` | Multi-web: returns signed token. Legacy: returns stream + headers. |
+| `handleStreamRequest(token, req, res)` | `void` | Verify token and stream file with Range support. |
 | `stat(fileId)` | `{ size, mtime, exists } \| null` | Lightweight existence check without streaming. |
 | `isVisible(fileId)` | `boolean` | Check visibility for the current `webId`. |
 | `delete(fileId)` | `OperationResult` | Soft-delete (marks as deleted for this `webId`). |
@@ -181,38 +271,35 @@ The main entry point. Owns all media logic; delegates persistence to the reposit
 | `getBatchFiles(ids)` | `{ items, missingIds }` | Efficient batch lookup by ID list. |
 | `getChanges(sinceTimestamp)` | `Change[]` | Get visibility changes since a timestamp (for sync). |
 
-### Streaming / Resource Model
+### Return Contracts
 
-The engine returns **opaque resources**, never raw filesystem paths:
-
-```js
-// ❌ NEVER: your app builds paths from user input
-const path = `/media/${req.params.id}.mp3`;
-res.sendFile(path); // ← path traversal risk!
-
-// ✅ ALWAYS: your app asks the engine for a resource
-const target = await engine.getServeTarget(req.params.id);
-if (target.error) return res.status(404).json({ error: target.error });
-res.sendFile(target.path, { headers: target.headers });
-// Or, for streaming frameworks:
-target.stream.pipe(response);
-```
-
-The `getServeTarget()` contract:
+**Multi-web `getServeTarget()`**:
 
 ```ts
-interface ServeTarget {
+interface TokenTarget {
+  success: true;
+  streamUrl: string;       // e.g. '/api/stream?token=eyJpZCI6Im1vdmllMTIz...'
+  metadata: {
+    mimeType: string;
+    size: number;
+  };
+}
+```
+
+**Legacy `getServeTarget()`**:
+
+```ts
+interface StreamTarget {
   stream: ReadableStream;        // Node.js readable stream
   size: number;                  // file size in bytes
   mimeType: string;              // e.g. 'audio/flac', 'video/mp4'
   etag: string;                  // file ID for cache validation
   lastModified: number;          // unix timestamp
   headers: Record<string, string>; // Cache-Control, Accept-Ranges
-  path?: string;                 // optional absolute path (for res.sendFile)
 }
 ```
 
-The `resolve()` contract (metadata only, no paths):
+**`resolve()` contract (metadata only, no paths)**:
 
 ```ts
 interface ResolvedFile {
@@ -228,6 +315,73 @@ interface ResolvedFile {
   // NO fullPath, NO absolute path
 }
 ```
+
+---
+
+## Multi-Web Gateway
+
+### How It Works
+
+The engine runs as a **central gateway**. Multiple web applications connect to a single instance. Each web app gets its own policy defined in `config.toml`.
+
+```
+Web App A (Movies) ──┐
+Web App B (Music) ───┼──→ MediaEngine (singleton)
+Web App C (Admin) ───┘         ↓
+                      resolve() / stream() / search()
+                            ↓
+                      SQLite DB + Filesystem
+```
+
+### Token-Based Streaming
+
+Web apps never see raw filesystem paths. The engine returns **signed, time-limited tokens**:
+
+```js
+// Web app identifies itself by webId
+const result = await engine.getServeTarget('movie123', 'movies');
+// → { success: true, streamUrl: '/api/stream?token=eyJpZCI6Im1vdmllMTIz...', metadata: { mimeType: 'video/mp4', size: 1500000000 } }
+
+// Web app forwards streamUrl to client/browser
+// Client requests: GET /api/stream?token=eyJpZCI6Im1vdmllMTIz...
+
+// Engine handles stream endpoint
+app.get('/api/stream', async (req, res) => {
+  await engine.handleStreamRequest(req.query.token, req, res);
+});
+```
+
+**Security guarantees**:
+- Web app never knows the real file path
+- Tokens expire after 5 minutes
+- Policy (`allowed_roots` + `types`) is enforced on every stream request
+- HMAC-SHA256 signature prevents token forgery
+
+### Policy Enforcement
+
+Every `getServeTarget()` and `handleStreamRequest()` call enforces:
+
+1. **Web app registration** — `webId` must exist in `config.toml`
+2. **Allowed roots** — file's canonical path must be under one of the web app's `allowed_roots`
+3. **MIME type allowlist** — file's MIME type must be in the web app's `types`
+4. **Visibility check** — file must be `PRESENT` for the policy's `web_id` scope
+
+If any check fails, the engine returns `{ error: 'FORBIDDEN' }` or HTTP `403`.
+
+### HTTP Range Requests
+
+`handleStreamRequest` supports `Range` headers (`206 Partial Content`), enabling video seeking in browsers:
+
+```
+Browser: GET /api/stream?token=xxx
+         Header: Range: bytes=1048576-2097151
+
+Engine:  Status: 206 Partial Content
+         Header: Content-Range: bytes 1048576-2097151/1500000000
+         Body: requested chunk
+```
+
+This works over both HTTP and HTTPS. For cross-origin setups, ensure CORS headers allow the `Range` header.
 
 ---
 
@@ -267,6 +421,10 @@ engine.isVisible(fileId); // → true / false
 // when the current webId has it marked as DELETED
 ```
 
+### Zero Path Leakage
+
+The `resolve()` method always strips `fullPath` from its return value. Internal methods use `resolveFileForEngine()` which returns the full path, but this is never exposed to web applications.
+
 ---
 
 ## Scanner
@@ -284,9 +442,7 @@ const scanner = new MediaScanner({
     broadcastStats: () => io.emit('stats', scanner.getStatus()),
   },
   config: {
-    workers: 4,              // parallel scanning workers
     periodicMinutes: 15,     // full rescan interval
-    scanRecursive: true,     // recurse into subdirectories
   },
 });
 
@@ -302,10 +458,6 @@ scanner.pause();
 
 // Resume
 scanner.resume();
-
-// Status
-scanner.getStatus();
-// → { isScanning, isPaused, isWatcherRunning, pendingRescan }
 ```
 
 **Event Bus** — subscribe to scanner lifecycle events:
@@ -325,7 +477,7 @@ engine.events.on('scanner.resumed', (e) => console.log('Scanner resumed', e.time
 The repository interface decouples the engine from storage. Swap SQLite for PostgreSQL, in-memory for tests, or a remote API:
 
 ```js
-// The interface (56 methods)
+// The interface (~56 methods)
 class MediaRepository {
   // File operations
   getFileById(id)
@@ -395,6 +547,9 @@ await engine.listFiles({ limit: 10 }); // → [{ id: '1', name: 'song.flac', ...
 // Main engine
 import { MediaEngine, MediaScanner } from '@homelab/media-engine';
 
+// Config loader
+import { loadConfig } from '@homelab/media-engine';
+
 // Visibility (soft-delete, user-scoped)
 import { getVisibility, setVisibility, isVisible, getChanges } from '@homelab/media-engine';
 
@@ -409,6 +564,10 @@ import {
   detectConflicts,
   ENVIRONMENT_ORDER,
 } from '@homelab/media-engine';
+
+// Safety guards
+import { assertSafePath } from '@homelab/media-engine';
+import { assertVisible } from '@homelab/media-engine';
 ```
 
 ---
@@ -419,6 +578,9 @@ import {
 
 | Component | Status |
 |-----------|--------|
+| Multi-web gateway + TOML config | Stable |
+| Token-based streaming + HMAC | Stable |
+| HTTP Range requests (206) | Stable |
 | Path resolution & safety guards | Stable |
 | Visibility (per-user soft delete) | Stable |
 | Incremental scanner + watcher | Stable |
@@ -434,15 +596,17 @@ import {
 ## Testing
 
 ```bash
-# Run unit tests
+# Run all tests
 npm test
 
-# Mock-based tests (no SQLite required)
-node --test src/**/*.test.js
+# Mock-based tests only (no SQLite required)
+node --test tests/media-engine.test.js tests/contract.test.js tests/changeset.test.js tests/eventbus.test.js tests/resolver.test.js tests/lock.test.js tests/scanner.test.js tests/probe.test.js
 
-# Integration with SQLite
-node --test tests/**/*.test.js
+# SQLite integration tests
+node --test tests/visibility.test.js
 ```
+
+> **Note**: SQLite integration tests require a working `better-sqlite3` native binding for your Node.js version.
 
 The `MockMediaRepository` allows full engine testing without any external dependencies.
 
@@ -453,6 +617,7 @@ The `MockMediaRepository` allows full engine testing without any external depend
 - **Node.js** >= 18.0.0
 - **ESM** only (`"type": "module"`)
 - `better-sqlite3` (optional, only for SQLite backend)
+- `smol-toml` (included, for TOML config parsing)
 
 ---
 

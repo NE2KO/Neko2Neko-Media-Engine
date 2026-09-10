@@ -29,7 +29,10 @@
     "visibility"
   ],
   "license": "UNLICENSED",
+  "dependencies": {
+    "smol-toml": "^1.8.0"
+  },
   "devDependencies": {
-    "better-sqlite3": "^13.0.3"
+    "better-sqlite3": "^11.10.0"
   }
 }
