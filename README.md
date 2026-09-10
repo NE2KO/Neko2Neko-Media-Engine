@@ -132,7 +132,7 @@ const repository = new SqliteMediaRepository(db);
 const engine = new MediaEngine({
   configPath: './config.toml',
   repository,
-  mediaRoots: ['/mnt/media'],
+  mediaRoots: ['/media'],
 });
 
 // 4. Web app asks for stream URL (no paths leaked)
@@ -182,7 +182,7 @@ Create a `config.toml` in your engine working directory:
 
 ```toml
 [global]
-thumbnail_root = "/home/CATIAA/Engine/thumbnails"
+thumbnail_root = "./thumbnails"
 scan_period_minutes = 15
 scan_batch_size = 250
 startup_grace_ms = 30000
@@ -198,22 +198,22 @@ secret_key = "dev-only-change-in-production"
 # ---------------------------------------------------------------------------
 
 [web.movies]
-path = "/app/movies"
-allowed_roots = ["/mnt/media/movies"]
+path = "/movies"
+allowed_roots = ["/media/movies"]
 types = ["video/mp4", "video/x-matroska", "video/webm", "video/quicktime"]
 # web_id is the visibility scope for soft-delete checks.
 # If omitted, defaults to the section name ("movies").
 web_id = "release-movies"
 
 [web.music]
-path = "/app/music"
-allowed_roots = ["/mnt/media/music"]
+path = "/music"
+allowed_roots = ["/media/music"]
 types = ["audio/mpeg", "audio/flac", "audio/wav", "audio/ogg", "audio/aac", "image/jpeg", "image/png"]
 web_id = "release-music"
 
 [web.admin]
-path = "/app/admin"
-allowed_roots = ["/mnt/media"]
+path = "/admin"
+allowed_roots = ["/media"]
 types = ["video/mp4", "video/x-matroska", "audio/mpeg", "audio/flac", "image/jpeg", "image/png", "application/octet-stream"]
 web_id = "admin"
 ```

@@ -1,35 +1,35 @@
 [global]
-thumbnail_root = "/home/CATIAA/Engine/thumbnails"
+thumbnail_root = "./thumbnails"
 scan_period_minutes = 15
 scan_batch_size = 250
 startup_grace_ms = 30000
 probe_timeout = 15000
 
-# Ganti dengan secret key yang kuat di production.
-# Bisa di-generate dengan: openssl rand -hex 32
+# Replace with a strong secret key in production.
+# Generate with: openssl rand -hex 32
 secret_key = "dev-only-change-in-production"
 
 # ---------------------------------------------------------------------------
-# Web policies: setiap section mendefinisikan satu web app yang boleh akses.
-# Engine akan enforce policy ini pada setiap request stream.
+# Web policies: each section defines one web app that may access the engine.
+# The engine enforces these policies on every stream request.
 # ---------------------------------------------------------------------------
 
 [web.movies]
-path = "/app/movies"
-allowed_roots = ["/mnt/media/movies"]
+path = "/movies"
+allowed_roots = ["/media/movies"]
 types = ["video/mp4", "video/x-matroska", "video/webm", "video/quicktime"]
-# web_id adalah scope visibility yang digunakan untuk cek soft-delete.
-# Jika tidak diisi, sama dengan nama section (movies).
+# web_id is the visibility scope for soft-delete checks.
+# If omitted, defaults to the section name ("movies").
 web_id = "release-movies"
 
 [web.music]
-path = "/app/music"
-allowed_roots = ["/mnt/media/music"]
+path = "/music"
+allowed_roots = ["/media/music"]
 types = ["audio/mpeg", "audio/flac", "audio/wav", "audio/ogg", "audio/aac", "image/jpeg", "image/png"]
 web_id = "release-music"
 
 [web.admin]
-path = "/app/admin"
-allowed_roots = ["/mnt/media"]
+path = "/admin"
+allowed_roots = ["/media"]
 types = ["video/mp4", "video/x-matroska", "audio/mpeg", "audio/flac", "image/jpeg", "image/png", "application/octet-stream"]
 web_id = "admin"
